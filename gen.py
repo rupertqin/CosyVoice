@@ -4,6 +4,7 @@ import argparse
 sys.path.append('third_party/Matcha-TTS')
 # 重依赖（torch / hyperpyyaml / onnxruntime 等）延迟到解析参数后再导入，
 # 方便在未装依赖的环境里先跑 --help / 参数校验。
+# python gen.py --model cosyvoice3 --voice nice_caixukun --text-file output/speech.txt --out output/audio.wav --srt output/audio.srt
 _IMPORTS = None
 
 
@@ -109,14 +110,14 @@ def main():
     cv = CosyVoiceSRT(cosyvoice)   # 透明委托封装，不传 srt 参数时行为和原生完全一致
     set_all_random_seed(args.seed)
 
-    # 复用 CosyVoiceSRT：同步合成音频 + 逐句时间轴，可选导出 srt/vtt。
-    # 传 srt_path 时返回 (full_audio, subtitle_string) 并自动写文件；不传则只返回 audio。
+    # gen.py 只负责合成音频（可选逐句 srt）；逐词/逐字时间戳请用独立的 align_srt.py。
     result = cv.inference_zero_shot(
         tts_text, prompt_text, prompt_wav, stream=False,
         srt_path=args.srt, return_subtitles=args.srt_format,
         subtitle_min_length=args.srt_min_length,
     )
 
+    # 只要走了 srt 路径，返回 (audio, subtitle)；否则只返回 audio
     if args.srt:
         speech, subtitle = result
     else:
@@ -128,8 +129,9 @@ def main():
     if args.srt:
         with open(args.srt, 'w', encoding='utf-8') as fh:
             fh.write(subtitle)
-        print('已导出字幕到 {}（{} 格式，{} 条）'.format(
-            args.srt, args.srt_format, subtitle.count('\n') // 3 + (1 if args.srt_format == 'vtt' else 0)))
+        print('已导出逐句字幕到 {}（{} 格式，{} 条）'.format(
+            args.srt, args.srt_format,
+            subtitle.count('\n') // 3 + (1 if args.srt_format == 'vtt' else 0)))
 
 
 if __name__ == '__main__':

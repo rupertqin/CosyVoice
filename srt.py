@@ -72,7 +72,193 @@ def _trim_trailing_punct(s: str) -> str:
     return body + keep
 
 
-def split_subtitle_sentences(text: str, min_length: int = _SUBTITLE_MIN_LENGTH) -> List[str]:
+# ═══════════════════════════════════════════════════════════════
+#  Word-level timestamps via external ASR engines
+# ═══════════════════════════════════════════════════════════════
+# 两个引擎可选：funasr / mlx-whisper。ASR 只用于提取"声学时间戳"，
+# 最终 srt 里的文字一律用调用方提供的原文，保证不改字。
+
+_ASR_ENGINE = None   # 缓存已加载的引擎，避免重复加载模型
+_ASR_ENGINE_NAME = None
+
+
+def _load_funasr():
+    from funasr import AutoModel as FunASRAutoModel
+    # paraformer-zh 是官方短名，原生输出字级时间戳（timestamp 字段）。
+    # 注意：用长模型名 speech_paraformer-large_asr_nat-... 时不会返回 timestamp，
+    # 必须用 paraformer-zh 才能拿到逐字时间戳。
+    # 注意：不能加 punc_model！加标点模型后 text 会变成无空格连续文本，
+    # 导致 text.split() 无法逐字对齐 timestamp。去掉标点模型，text 才是
+    # 空格分隔的字，timestamp 与之逐一对应。
+    return FunASRAutoModel(model="paraformer-zh",
+                           vad_model="fsmn-vad",
+                           disable_update=True,
+                           device="cpu" if not _cuda_available() else "cuda")
+
+
+def _cuda_available():
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def _extract_funasr_words(wav_path, sample_rate):
+    """FunASR: 返回字级时间戳 [(char, start_sec, end_sec), ...]"""
+    global _ASR_ENGINE, _ASR_ENGINE_NAME
+    if _ASR_ENGINE is None or _ASR_ENGINE_NAME != 'funasr':
+        _ASR_ENGINE = _load_funasr()
+        _ASR_ENGINE_NAME = 'funasr'
+    res = _ASR_ENGINE.generate(input=wav_path, batch_size_s=60)
+    res = res[0]
+    words = []
+    # paraformer-zh 的 text 是空格分隔的字，timestamp 与之逐一对应（毫秒）
+    text = res.get('text', '')
+    ts = res.get('timestamp', []) or []
+    chars = text.split()
+    if len(ts) == len(chars):
+        for c, (s, e) in zip(chars, ts):
+            words.append((c, s / 1000.0, e / 1000.0))
+    return words
+
+
+def _load_mlx_whisper():
+    import mlx_whisper
+    return mlx_whisper
+
+
+def _extract_mlx_whisper_words(wav_path, sample_rate, model_id='mlx-community/whisper-large-v3-mlx'):
+    """mlx-whisper: 返回词级时间戳 [(char, start_sec, end_sec), ...]
+    注意：mlx-whisper 是词级（word）时间戳，中文一个词常含多个字，
+    这里把词的时长按其字数均分到每个字。
+    """
+    import mlx_whisper
+    res = mlx_whisper.transcribe(wav_path, path_or_hf_repo=model_id, word_timestamps=True)
+    words = []
+    for seg in res.get('segments', []):
+        for w in seg.get('words', []):
+            word_text = w['word'].replace(' ', '')
+            if not word_text:
+                continue
+            start, end = w['start'], w['end']
+            chars = list(word_text)
+            n = len(chars)
+            per = (end - start) / n if n else 0
+            for i, c in enumerate(chars):
+                words.append((c, start + i * per, start + (i + 1) * per))
+    return words
+
+
+def _asr_word_timestamps(wav_path, sample_rate, engine='funasr', model_id=None):
+    """统一入口：根据 engine 返回字级时间戳 [(char, start_sec, end_sec), ...]"""
+    if engine == 'funasr':
+        return _extract_funasr_words(wav_path, sample_rate)
+    elif engine == 'mlx-whisper':
+        return _extract_mlx_whisper_words(wav_path, sample_rate, model_id or 'mlx-community/whisper-large-v3-mlx')
+    else:
+        raise ValueError('unknown asr engine: {}'.format(engine))
+
+
+def char_level_timestamps(text, wav_path, sample_rate, engine='funasr', model_id=None):
+    """把 ASR 时间戳映射回给定原文，返回逐字时间 [(char, start_sec, end_sec), ...]。
+
+    保证每个 char 都来自 text（不改字）。使用 difflib 在字符级把 ASR 识别序列
+    对齐到原文；ASR 缺失/多余的字通过相邻锚点线性插值补全。
+    """
+    import difflib
+    asr_words = _asr_word_timestamps(wav_path, sample_rate, engine, model_id)
+    if not asr_words:
+        # ASR 无结果，退化为按时长均匀分配
+        raise RuntimeError('ASR 未能提取任何字级时间戳')
+
+    asr_text = ''.join(c for c, _, _ in asr_words)
+    target = ''.join(c for c in text)
+
+    sm = difflib.SequenceMatcher(None, target, asr_text, autojunk=False)
+    # 建立原文每个字符的时间区间
+    n = len(target)
+    starts = [None] * n
+    ends = [None] * n
+    asr_idx = 0
+    # 通过 opcodes 对齐：只信任 equal 块；其余用插值
+    matches = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            # target[i1:i2] 对应 asr[j1:j2]
+            for k, off in enumerate(range(j1, j2)):
+                c, s, e = asr_words[off]
+                matches.append((i1 + k, s, e))
+    # 把所有匹配按 target 位置填入，缺失的用相邻插值
+    match_map = {i: (s, e) for i, s, e in matches}
+    filled = []
+    last_i, last_e = -1, 0.0
+    for i in range(n):
+        if i in match_map:
+            s, e = match_map[i]
+        else:
+            # 插值：找前后最近的锚点
+            prev_e = last_e
+            next_s = None
+            for k in range(i + 1, n):
+                if k in match_map:
+                    next_s = match_map[k][0]
+                    break
+            if next_s is not None:
+                s = prev_e
+                e = next_s
+            else:
+                s = prev_e
+                e = prev_e + 0.1
+        starts[i] = s
+        ends[i] = e
+        filled.append((target[i], s, e))
+        last_i, last_e = i, e
+    return filled
+
+
+def word_level_timestamps(text, char_segs):
+    """把逐字时间戳按 jieba 分词合并成词级时间戳。
+
+    Args:
+        text: 原文（与 char_segs 字符一一对应）。
+        char_segs: 逐字时间戳 [(char, start_sec, end_sec), ...]。
+
+    Returns:
+        词级时间戳 [(word, start_sec, end_sec), ...]，每个 word 来自原文
+        （jieba 切分，含标点），start=词首字 start，end=词末字 end。
+    """
+    import jieba
+    # 用 jieba 对原文分词（保留标点）
+    tokens = [t for t in jieba.cut(text) if t.strip()]
+    if not tokens:
+        return [(c, s, e) for c, s, e in char_segs]
+
+    # 建立 原文字符 -> 时间戳 的映射（跳过标点字的时间）
+    char_time = {c: (s, e) for c, s, e in char_segs}
+    # 需要按原文顺序取时间戳；char_segs 顺序即原文顺序
+    idx = 0
+    segs_by_char = {}
+    for c, s, e in char_segs:
+        segs_by_char[idx] = (s, e)
+        idx += 1
+
+    # 重新按原文文本映射（去掉可能被 ASR 归一化的差异）
+    # 直接按 char_segs 的顺序遍历原文字符
+    pos = 0
+    words = []
+    for token in tokens:
+        n = len(token)
+        # 取 token 对应的字区间 [pos, pos+n)
+        start = segs_by_char[pos][0] if pos in segs_by_char else 0.0
+        end_pos = pos + n - 1
+        end = segs_by_char[end_pos][1] if end_pos in segs_by_char else start
+        words.append((token, start, end))
+        pos += n
+    return words
+
+
+
     """按逗号/句号/问号/感叹号等标点切分，再合并过短的相邻句。
 
     与 CosyVoice 合成用的 60~80 token 长句切分解耦：
@@ -220,6 +406,8 @@ class CosyVoiceSRT:
         return_subtitles: Optional[str], build_subtitles_only: bool,
         return_seq: bool, subtitle_split: bool = True,
         subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
+        asr_engine: Optional[str] = None,
+        asr_model_id: Optional[str] = None,
         *args, **kwargs
     ):
         """Run a single inference method, collect segments, optionally build subtitles.
@@ -236,6 +424,11 @@ class CosyVoiceSRT:
             subtitle_min_length: minimum character length per subtitle. Adjacent
                 short sentences are merged backward so each subtitle is at least
                 this long. Pass 0 to disable merging (split purely by punctuation).
+            asr_engine: optional ASR engine ('funasr' or 'mlx-whisper') for
+                word-level timestamps. When set, synthesised audio is aligned to
+                tts_text via ASR and a word-level SRT is produced.
+            asr_model_id: optional model id for mlx-whisper (default
+                'mlx-community/whisper-large-v3-mlx').
             *args / **kwargs: forwarded to the inference method.
 
         Returns:
@@ -248,7 +441,8 @@ class CosyVoiceSRT:
             Otherwise:
                 (full_audio_tensor, subtitles_string)
         """
-        want_subtitles = return_srt or bool(srt_path) or return_subtitles is not None
+        word_srt = asr_engine is not None
+        want_subtitles = return_srt or bool(srt_path) or return_subtitles is not None or word_srt
 
         if not want_subtitles and not build_subtitles_only and not return_seq:
             # No SRT requested — delegate to original
@@ -332,6 +526,32 @@ class CosyVoiceSRT:
 
         subtitle_format = (return_subtitles if return_subtitles is not None
                            else 'srt')
+
+        if word_srt:
+            # ── Word-level SRT via ASR alignment ──
+            if not isinstance(tts_text, str):
+                raise ValueError('word-level SRT requires tts_text to be a string, not a generator')
+            import tempfile, os as _os
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpf:
+                tmp_wav = tmpf.name
+            try:
+                import torchaudio
+                torchaudio.save(tmp_wav, full_audio, self.sample_rate)
+                word_segs = char_level_timestamps(
+                    tts_text, tmp_wav, self.sample_rate,
+                    engine=asr_engine, model_id=asr_model_id,
+                )
+            finally:
+                if _os.path.exists(tmp_wav):
+                    _os.remove(tmp_wav)
+            # 逐字（可合并为词或保持逐字）构建 segment 列表
+            segments = [{'text': c, 'start': s, 'end': e} for c, s, e in word_segs]
+            subtitles_content = self._format_subtitles(segments, subtitle_format)
+            if srt_path:
+                with open(srt_path, 'w', encoding='utf-8') as f:
+                    f.write(subtitles_content)
+            return full_audio, subtitles_content
+
         subtitles_content = self._format_subtitles(segments, subtitle_format)
 
         if srt_path:
@@ -349,13 +569,16 @@ class CosyVoiceSRT:
                       build_subtitles_only: bool = False,
                       return_seq: bool = False,
                       subtitle_split: bool = True,
-                      subtitle_min_length: int = _SUBTITLE_MIN_LENGTH):
-        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq:
+                      subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
+                      asr_engine: Optional[str] = None,
+                      asr_model_id: Optional[str] = None):
+        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq or asr_engine:
             assert not stream, 'return_srt requires stream=False; use return_seq for streaming access'
         return self._run_and_build(
             'inference_sft', tts_text, return_srt, srt_path,
             return_subtitles, build_subtitles_only, return_seq,
             subtitle_split, subtitle_min_length,
+            asr_engine, asr_model_id,
             spk_id, stream=stream, speed=speed, text_frontend=text_frontend
         )
 
@@ -367,13 +590,16 @@ class CosyVoiceSRT:
                             build_subtitles_only: bool = False,
                             return_seq: bool = False,
                             subtitle_split: bool = True,
-                            subtitle_min_length: int = _SUBTITLE_MIN_LENGTH):
-        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq:
+                            subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
+                            asr_engine: Optional[str] = None,
+                            asr_model_id: Optional[str] = None):
+        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq or asr_engine:
             assert not stream, 'return_srt requires stream=False; use return_seq for streaming access'
         return self._run_and_build(
             'inference_zero_shot', tts_text, return_srt, srt_path,
             return_subtitles, build_subtitles_only, return_seq,
             subtitle_split, subtitle_min_length,
+            asr_engine, asr_model_id,
             prompt_text, prompt_wav,
             zero_shot_spk_id=zero_shot_spk_id,
             stream=stream, speed=speed, text_frontend=text_frontend
@@ -387,13 +613,16 @@ class CosyVoiceSRT:
                                 build_subtitles_only: bool = False,
                                 return_seq: bool = False,
                                 subtitle_split: bool = True,
-                                subtitle_min_length: int = _SUBTITLE_MIN_LENGTH):
-        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq:
+                                subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
+                                asr_engine: Optional[str] = None,
+                                asr_model_id: Optional[str] = None):
+        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq or asr_engine:
             assert not stream, 'return_srt requires stream=False; use return_seq for streaming access'
         return self._run_and_build(
             'inference_cross_lingual', tts_text, return_srt, srt_path,
             return_subtitles, build_subtitles_only, return_seq,
             subtitle_split, subtitle_min_length,
+            asr_engine, asr_model_id,
             prompt_wav,
             zero_shot_spk_id=zero_shot_spk_id,
             stream=stream, speed=speed, text_frontend=text_frontend
@@ -406,13 +635,16 @@ class CosyVoiceSRT:
                            build_subtitles_only: bool = False,
                            return_seq: bool = False,
                            subtitle_split: bool = True,
-                           subtitle_min_length: int = _SUBTITLE_MIN_LENGTH):
-        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq:
+                           subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
+                           asr_engine: Optional[str] = None,
+                           asr_model_id: Optional[str] = None):
+        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq or asr_engine:
             assert not stream, 'return_srt requires stream=False; use return_seq for streaming access'
         return self._run_and_build(
             'inference_instruct', tts_text, return_srt, srt_path,
             return_subtitles, build_subtitles_only, return_seq,
             subtitle_split, subtitle_min_length,
+            asr_engine, asr_model_id,
             spk_id, instruct_text,
             stream=stream, speed=speed, text_frontend=text_frontend
         )
@@ -425,13 +657,16 @@ class CosyVoiceSRT:
                             build_subtitles_only: bool = False,
                             return_seq: bool = False,
                             subtitle_split: bool = True,
-                            subtitle_min_length: int = _SUBTITLE_MIN_LENGTH):
-        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq:
+                            subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
+                            asr_engine: Optional[str] = None,
+                            asr_model_id: Optional[str] = None):
+        if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq or asr_engine:
             assert not stream, 'return_srt requires stream=False; use return_seq for streaming access'
         return self._run_and_build(
             'inference_instruct2', tts_text, return_srt, srt_path,
             return_subtitles, build_subtitles_only, return_seq,
             subtitle_split, subtitle_min_length,
+            asr_engine, asr_model_id,
             instruct_text, prompt_wav,
             zero_shot_spk_id=zero_shot_spk_id,
             stream=stream, speed=speed, text_frontend=text_frontend
