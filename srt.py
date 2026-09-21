@@ -258,7 +258,7 @@ def word_level_timestamps(text, char_segs):
     return words
 
 
-
+def split_subtitle_sentences(text, min_length=_SUBTITLE_MIN_LENGTH):
     """按逗号/句号/问号/感叹号等标点切分，再合并过短的相邻句。
 
     与 CosyVoice 合成用的 60~80 token 长句切分解耦：
