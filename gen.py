@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+from typing import Any
 sys.path.append('third_party/Matcha-TTS')
 # 重依赖（torch / hyperpyyaml / onnxruntime 等）延迟到解析参数后再导入，
 # 方便在未装依赖的环境里先跑 --help / 参数校验。
@@ -14,8 +15,9 @@ def _load_deps():
         return _IMPORTS
     from cosyvoice.cli.cosyvoice import AutoModel
     from cosyvoice.utils.common import set_all_random_seed
+    import torch
     import torchaudio
-    _IMPORTS = (AutoModel, set_all_random_seed, torchaudio)
+    _IMPORTS = (AutoModel, set_all_random_seed, torch, torchaudio)
     return _IMPORTS
 
 # 支持的模型 -> (本地模型目录, 是否 chat 式 prompt)
@@ -103,30 +105,44 @@ def main():
     print('prompt 文本: {}'.format(prompt_text))
     print('目标文本: {}'.format(tts_text))
 
-    AutoModel, set_all_random_seed, torchaudio = _load_deps()
-    from srt import CosyVoiceSRT
+    AutoModel, set_all_random_seed, torch, torchaudio = _load_deps()
+    from srt import CosyVoiceSRT, expand_pinyin_annotations
+
+    # 发音注解支持：信{xìn} -> TTS 用 [x][ìn]（仅 cosyvoice3），字幕保留"信"
+    tts_text_in, subtitle_text = expand_pinyin_annotations(tts_text)
+    if tts_text_in != tts_text:
+        print('检测到发音注解，TTS 文本: {}'.format(tts_text_in))
+        print('字幕文本（剥除注解）: {}'.format(subtitle_text))
+        if args.model != 'cosyvoice3':
+            print('警告：发音注解的拼音 hotfix 仅 cosyvoice3 支持，当前模型 {} 可能不生效'.format(args.model))
 
     cosyvoice = AutoModel(model_dir=model_dir)
-    cv = CosyVoiceSRT(cosyvoice)   # 透明委托封装，不传 srt 参数时行为和原生完全一致
+    # CosyVoiceSRT 是动态委托封装（__getattr__ 转发），返回类型随参数变化，
+    # 标注为 Any 以避免静态检查对联合类型的误报。
+    cv: Any = CosyVoiceSRT(cosyvoice)
     set_all_random_seed(args.seed)
 
     # gen.py 只负责合成音频（可选逐句 srt）；逐词/逐字时间戳请用独立的 align_srt.py。
-    result = cv.inference_zero_shot(
-        tts_text, prompt_text, prompt_wav, stream=False,
-        srt_path=args.srt, return_subtitles=args.srt_format,
-        subtitle_min_length=args.srt_min_length,
-    )
-
-    # 只要走了 srt 路径，返回 (audio, subtitle)；否则只返回 audio
+    # subtitle_text：字幕断句使用剥除注解后的干净原文，合成用展开拼音后的文本。
+    subtitle = None
     if args.srt:
-        speech, subtitle = result
+        # 走字幕路径：返回 (full_audio, subtitle_string) 并自动写文件
+        speech, subtitle = cv.inference_zero_shot(
+            tts_text_in, prompt_text, prompt_wav, stream=False,
+            srt_path=args.srt, return_subtitles=args.srt_format,
+            subtitle_min_length=args.srt_min_length,
+            subtitle_text=subtitle_text,
+        )
     else:
-        speech = result
+        # 不导出字幕：透明委托原生生成器，逐段收集后拼接音频
+        chunks = [j['tts_speech'] for j in cv.inference_zero_shot(
+            tts_text_in, prompt_text, prompt_wav, stream=False)]
+        speech = torch.cat(chunks, dim=1) if len(chunks) > 1 else chunks[0]
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torchaudio.save(args.out, speech, cosyvoice.sample_rate)
     print('已保存到 {}（时长 {:.2f}s）'.format(args.out, speech.shape[1] / cosyvoice.sample_rate))
-    if args.srt:
+    if args.srt and subtitle is not None:
         with open(args.srt, 'w', encoding='utf-8') as fh:
             fh.write(subtitle)
         print('已导出逐句字幕到 {}（{} 格式，{} 条）'.format(

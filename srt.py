@@ -73,6 +73,54 @@ def _trim_trailing_punct(s: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  Pinyin pronunciation annotations: 信{xìn}
+# ═══════════════════════════════════════════════════════════════
+# 注释式发音修正：在字后用花括号标注带调拼音，如 信{xìn}。
+# 展开后：
+#   - TTS 文本：信{xìn} -> [x][ìn]（CosyVoice3 hotfix 拼音，仅 cosyvoice3 支持）
+#   - 字幕文本：信{xìn} -> 信（保持干净原文，供字幕与 ASR 对齐使用）
+
+_PINYIN_INITIALS = ['zh', 'ch', 'sh', 'b', 'p', 'm', 'f', 'd', 't', 'n', 'l',
+                    'g', 'k', 'h', 'j', 'q', 'x', 'r', 'z', 'c', 's', 'y', 'w']
+_ANNOTATION_RE = re.compile(r'(.)(\{[a-zāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ]+\})')
+
+
+def _pinyin_to_hotfix(pinyin: str) -> str:
+    """把带调拼音音节转成 CosyVoice3 hotfix 语法 [声母][韵母]。
+
+    例如 xìn -> [x][ìn]，shì -> [sh][ì]，ā（零声母）-> [ā]。
+    """
+    pinyin = pinyin.strip()
+    for ini in _PINYIN_INITIALS:
+        if pinyin.startswith(ini):
+            final = pinyin[len(ini):]
+            if final:
+                return '[{}][{}]'.format(ini, final)
+            return '[{}]'.format(ini)
+    # 零声母音节（如 ā、ài）整体作为韵母 token
+    return '[{}]'.format(pinyin)
+
+
+def expand_pinyin_annotations(text: str):
+    """展开注释式发音标注 信{xìn}。
+
+    Returns:
+        (tts_text, clean_text)
+        tts_text: 注解展开为 CosyVoice3 hotfix 拼音（如 [x][ìn]），用于合成；
+        clean_text: 注解剥除，保留原字（如 信），用于字幕与对齐。
+    """
+    def _to_hotfix(m):
+        return _pinyin_to_hotfix(m.group(2)[1:-1])
+
+    def _to_clean(m):
+        return m.group(1)
+
+    tts_text = _ANNOTATION_RE.sub(_to_hotfix, text)
+    clean_text = _ANNOTATION_RE.sub(_to_clean, text)
+    return tts_text, clean_text
+
+
+# ═══════════════════════════════════════════════════════════════
 #  Word-level timestamps via external ASR engines
 # ═══════════════════════════════════════════════════════════════
 # 两个引擎可选：funasr / mlx-whisper。ASR 只用于提取"声学时间戳"，
@@ -408,6 +456,7 @@ class CosyVoiceSRT:
         subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
         asr_engine: Optional[str] = None,
         asr_model_id: Optional[str] = None,
+        subtitle_text: Optional[str] = None,
         *args, **kwargs
     ):
         """Run a single inference method, collect segments, optionally build subtitles.
@@ -449,10 +498,13 @@ class CosyVoiceSRT:
             return getattr(self._cv, method_name)(tts_text, *args, **kwargs)
 
         # ── Pre-split text for SRT ──
+        # subtitle_text（若提供）用于字幕断句（如剥除发音注解后的干净原文），
+        # 合成仍使用 tts_text（含 hotfix 拼音）。两者标点一致时句段数一一对应。
         text_frontend = kwargs.pop('text_frontend', True)
-        if isinstance(tts_text, str):
+        split_source = subtitle_text if subtitle_text is not None else tts_text
+        if isinstance(split_source, str):
             texts = list(self._cv.frontend.text_normalize(
-                tts_text, split=True, text_frontend=text_frontend
+                split_source, split=True, text_frontend=text_frontend
             ))
         else:
             # tts_text is a generator; we can't pre-split
@@ -592,14 +644,15 @@ class CosyVoiceSRT:
                             subtitle_split: bool = True,
                             subtitle_min_length: int = _SUBTITLE_MIN_LENGTH,
                             asr_engine: Optional[str] = None,
-                            asr_model_id: Optional[str] = None):
+                            asr_model_id: Optional[str] = None,
+                            subtitle_text: Optional[str] = None):
         if return_srt or srt_path or return_subtitles or build_subtitles_only or return_seq or asr_engine:
             assert not stream, 'return_srt requires stream=False; use return_seq for streaming access'
         return self._run_and_build(
             'inference_zero_shot', tts_text, return_srt, srt_path,
             return_subtitles, build_subtitles_only, return_seq,
             subtitle_split, subtitle_min_length,
-            asr_engine, asr_model_id,
+            asr_engine, asr_model_id, subtitle_text,
             prompt_text, prompt_wav,
             zero_shot_spk_id=zero_shot_spk_id,
             stream=stream, speed=speed, text_frontend=text_frontend

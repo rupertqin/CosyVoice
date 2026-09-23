@@ -4,11 +4,11 @@
 
 ## 脚本总览
 
-| 脚本 | 职责 |
-|------|------|
-| `gen.py` | 合成音频（可选逐句 srt） |
+| 脚本           | 职责                                                         |
+| -------------- | ------------------------------------------------------------ |
+| `gen.py`       | 合成音频（可选逐句 srt）                                     |
 | `align_srt.py` | 对已有音频 + 已知文本做逐词/逐字时间戳字幕（ASR 只做时间戳） |
-| `srt.py` | 底层封装（`CosyVoiceSRT` + 对齐函数） |
+| `srt.py`       | 底层封装（`CosyVoiceSRT` + 对齐函数）                        |
 
 **核心原则**：`gen.py` 只合成音频；`align_srt.py` 只做时间戳对齐，且**字幕文字 100% 使用你提供的原文**，ASR 不修改文字。
 
@@ -34,16 +34,16 @@ conda run -n cosyvoice pip install jieba               # 中文分词（逐词�
 
 ### 参数
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `--voice` | 是 | 参考音色（见下方"可用音色"） |
-| `--text` / `--text-file` | 是 | 合成文本（二选一，优先 `--text-file`） |
-| `--model` | 否 | `cosyvoice2`（默认）/ `cosyvoice3` |
-| `--out` | 否 | 输出 wav 路径，默认 `output.wav` |
-| `--srt` | 否 | 同步导出逐句 srt 路径（不传不导出） |
-| `--srt-format` | 否 | `srt`（默认）/ `vtt` |
-| `--srt-min-length` | 否 | 逐句字幕最短字数，相邻过短句向后合并（默认 12；传 0 不合并） |
-| `--seed` | 否 | 随机种子，固定可复现 |
+| 参数                     | 必填 | 说明                                                         |
+| ------------------------ | ---- | ------------------------------------------------------------ |
+| `--voice`                | 是   | 参考音色（见下方"可用音色"）                                 |
+| `--text` / `--text-file` | 是   | 合成文本（二选一，优先 `--text-file`）                       |
+| `--model`                | 否   | `cosyvoice2`（默认）/ `cosyvoice3`                           |
+| `--out`                  | 否   | 输出 wav 路径，默认 `output.wav`                             |
+| `--srt`                  | 否   | 同步导出逐句 srt 路径（不传不导出）                          |
+| `--srt-format`           | 否   | `srt`（默认）/ `vtt`                                         |
+| `--srt-min-length`       | 否   | 逐句字幕最短字数，相邻过短句向后合并（默认 12；传 0 不合并） |
+| `--seed`                 | 否   | 随机种子，固定可复现                                         |
 
 ### 可用音色
 
@@ -83,28 +83,28 @@ conda run -n cosyvoice python gen.py \
 
 ### 参数
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `--audio` | 是 | 已合成的 wav 路径 |
-| `--text` / `--text-file` | 是 | 已知文本（二选一，优先 `--text-file`） |
-| `--engine` | 是 | `funasr` 或 `mlx-whisper` |
-| `--granularity` | 否 | `word`（默认，jieba 分词）/ `char`（逐字） |
-| `--model` | 否 | mlx-whisper 模型 id（默认 `mlx-community/whisper-large-v3-mlx`）；funasr 忽略 |
-| `--out` | 否 | 输出字幕路径（不传则打印到 stdout） |
-| `--format` | 否 | `srt`（默认）/ `vtt` |
+| 参数                     | 必填 | 说明                                                                          |
+| ------------------------ | ---- | ----------------------------------------------------------------------------- |
+| `--audio`                | 是   | 已合成的 wav 路径                                                             |
+| `--text` / `--text-file` | 是   | 已知文本（二选一，优先 `--text-file`）                                        |
+| `--engine`               | 是   | `funasr` 或 `mlx-whisper`                                                     |
+| `--granularity`          | 否   | `word`（默认，jieba 分词）/ `char`（逐字）                                    |
+| `--model`                | 否   | mlx-whisper 模型 id（默认 `mlx-community/whisper-large-v3-mlx`）；funasr 忽略 |
+| `--out`                  | 否   | 输出字幕路径（不传则打印到 stdout）                                           |
+| `--format`               | 否   | `srt`（默认）/ `vtt`                                                          |
 
 ### 示例
 
 ```bash
 # FunASR，词级（默认）
 conda run -n cosyvoice python align_srt.py \
-  --audio output/out.wav --text-file output/speech.txt \
-  --engine funasr --out output/out.funasr.word.srt
+  --audio output/audio.wav --text-file output/speech.txt \
+  --engine funasr --out output/audio.funasr.word.srt
 
 # mlx-whisper，词级
 conda run -n cosyvoice python align_srt.py \
-  --audio output/out.wav --text-file output/speech.txt \
-  --engine mlx-whisper --out output/out.mlx.word.srt
+  --audio output/audio.wav --text-file output/speech.txt \
+  --engine mlx-whisper --out output/audio.mlx.word.srt
 
 # 逐字粒度
 conda run -n cosyvoice python align_srt.py \
@@ -139,10 +139,10 @@ conda run -n cosyvoice python align_srt.py --audio out.wav --text-file tts.txt \
 
 同一段约 100 秒中文音频、同机 Apple Silicon 实测：
 
-| 引擎 | 端到端耗时 | 说明 |
-|------|-----------|------|
-| FunASR (`paraformer-zh`) | ~22s | CPU onnx 推理，快 |
-| mlx-whisper (`large-v3`) | ~194s | 模型大（1550M），较慢 |
+| 引擎                     | 端到端耗时 | 说明                  |
+| ------------------------ | ---------- | --------------------- |
+| FunASR (`paraformer-zh`) | ~22s       | CPU onnx 推理，快     |
+| mlx-whisper (`large-v3`) | ~194s      | 模型大（1550M），较慢 |
 
 - **追求速度** → 用 `funasr`
 - **追求效果**（复杂音频/口音/噪声）→ 用 `mlx-whisper`，或用 `--model` 指定小模型（如 `whisper-medium` / `whisper-small`）提速
@@ -152,13 +152,55 @@ conda run -n cosyvoice python align_srt.py --audio out.wav --text-file tts.txt \
 ## 6. 字幕断句规则（逐句模式）
 
 `gen.py --srt` 的逐句字幕由 `srt.py` 处理，规则：
+
 - 按逗号/句号/问号/感叹号等标点切分
 - 相邻短句不足 `--srt-min-length`（默认 12 字）会向后合并成一句
 - 每条字幕句尾只保留问号 `？?` 和感叹号 `！!`，去掉其它标点
 
 ---
 
-## 7. 常见问题
+## 7. 发音注解（注释式音标）
+
+读错的字可以用**注释式拼音注解**修正：在字后面用花括号标注带调拼音。
+
+### 语法
+
+```
+信{xìn}    # 字 + {带调拼音}
+给{jǐ}予   # 如 example.py 的 hotfix 示例"给予"读 jǐ
+阿{ā}      # 零声母音节整体作为韵母
+```
+
+### 行为（自动处理，无需手动拆分）
+
+| 用途 | 展开结果 |
+|------|---------|
+| TTS 合成 | `信{xìn}` → `[x][ìn]`（CosyVoice3 hotfix 拼音 token） |
+| 字幕/对齐 | `信{xìn}` → `信`（剥除注解，保留干净原字） |
+
+- `gen.py`：合成用展开拼音的文本；`--srt` 逐句字幕自动用剥除注解的干净文本
+- `align_srt.py`：自动剥除注解，对齐与字幕均使用干净原文
+- **仅 `--model cosyvoice3` 支持**拼音 hotfix（CosyVoice2 无拼音 token），用 cosyvoice2 时会打印警告
+- 拼音必须带声调符号（如 `xìn` 不是 `xin`），声母/韵母需在 `CosyVoice3Tokenizer` 支持列表内（`cosyvoice/tokenizer/tokenizer.py:295`）
+
+### 示例
+
+```bash
+# speech.txt 第20行：信{xìn}负责提高关系的可预测性
+# 合成（音频里"信"读 xìn）
+conda run -n cosyvoice python gen.py --model cosyvoice3 \
+  --voice man_surprise --text-file speech.txt --out out.wav --srt out.sentence.srt
+
+# 对齐（字幕里显示干净的"信"）
+conda run -n cosyvoice python align_srt.py --audio out.wav \
+  --text-file speech.txt --engine funasr --out out.word.srt
+```
+
+> 也可以直接用 CosyVoice3 原生替换式语法 `[x][ìn]`（字被拼音替换），但字幕与对齐需另备干净文本。推荐注释式 `信{xìn}`，一份文本同时服务合成与字幕。
+
+---
+
+## 8. 常见问题
 
 **Q: 为什么必须装 modelscope？**
 A: `cosyvoice/cli/cosyvoice.py` 顶层无条件 `from modelscope import snapshot_download`，不装就无法 import CosyVoice。

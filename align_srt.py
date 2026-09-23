@@ -9,21 +9,15 @@ ASR 只用于提取声学时间戳并映射回原文，绝不改动文字。
 
 用法示例：
     # 用 FunASR 对齐
-    python align.py --audio out.wav --text "今天天气真好。我们出去玩吧。" \\
-                    --engine funasr --out out.funasr.srt
+    python align.py --audio output/audio.wav --text "今天天气真好。我们出去玩吧。" \\
+                    --engine funasr --out output/audio.word.srt
 
     # 用 mlx-whisper 对齐（可指定模型）
-    python align.py --audio out.wav --text "..." --engine mlx-whisper \\
-                    --model mlx-community/whisper-large-v3-mlx --out out.mlx.srt
+    python align.py --audio output/audio.wav --text "..." --engine mlx-whisper \\
+                    --model mlx-community/whisper-large-v3-mlx --out output/audio.mlx.srt
 """
 import os
 import argparse
-
-sys_path_ok = True
-try:
-    from srt import char_level_timestamps, word_level_timestamps, build_srt, build_vtt
-except ImportError:
-    sys_path_ok = False
 
 
 def main():
@@ -43,8 +37,12 @@ def main():
                         help='字幕粒度：word=按词（jieba 分词，默认）；char=逐字')
     args = parser.parse_args()
 
-    if not sys_path_ok:
-        print('错误：无法导入 srt 模块，请确认在 CosyVoice 仓库根目录运行')
+    # 延迟导入 srt 模块（依赖 torch 等，且需在仓库根目录）
+    try:
+        from srt import (char_level_timestamps, word_level_timestamps,
+                         build_srt, build_vtt, expand_pinyin_annotations)
+    except ImportError:
+        print('错误：无法导入 srt 模块，请确认在 CosyVoice 仓库根目录、装好依赖的环境运行')
         return
 
     if args.text_file:
@@ -58,6 +56,11 @@ def main():
     # 移除文本内的换行：TTS 合成的语音是连续文本，逐字对齐时不应含换行符
     text = text.replace('\n', '').replace('\r', '')
     text = ' '.join(text.split())  # 压缩多余空白
+    # 剥除发音注解（如 信{xìn} -> 信）：对齐与字幕都应使用干净原文
+    text_clean = expand_pinyin_annotations(text)[1]
+    if text_clean != text:
+        print('检测到发音注解，已剥除用于对齐/字幕: {}'.format(text_clean))
+    text = text_clean
     if not os.path.exists(args.audio):
         print('错误：音频不存在 {}'.format(args.audio))
         return
