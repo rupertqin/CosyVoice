@@ -208,11 +208,16 @@ def _asr_word_timestamps(wav_path, sample_rate, engine='funasr', model_id=None):
         raise ValueError('unknown asr engine: {}'.format(engine))
 
 
-def char_level_timestamps(text, wav_path, sample_rate, engine='funasr', model_id=None):
-    """把 ASR 时间戳映射回给定原文，返回逐字时间 [(char, start_sec, end_sec), ...]。
+def char_level_timestamps(text, wav_path, sample_rate, engine='funasr', model_id=None,
+                          return_align=False):
+    """把 ASR 时间戳映射回给定原文，返回逐字时间。
 
     保证每个 char 都来自 text（不改字）。使用 difflib 在字符级把 ASR 识别序列
     对齐到原文；ASR 缺失/多余的字通过相邻锚点线性插值补全。
+
+    Args:
+        return_align: 为 True 时返回 4 元组 (char, start, end, aligned)，
+            aligned 表示该字是否被 ASR 真正对齐（False = 插值补出的）。
     """
     import difflib
     asr_words = _asr_word_timestamps(wav_path, sample_rate, engine, model_id)
@@ -220,7 +225,19 @@ def char_level_timestamps(text, wav_path, sample_rate, engine='funasr', model_id
         # ASR 无结果，退化为按时长均匀分配
         raise RuntimeError('ASR 未能提取任何字级时间戳')
 
-    asr_text = ''.join(c for c, _, _ in asr_words)
+    # ASR token 可能含多个字符（英文单词/数字等），而 SequenceMatcher 的下标
+    # 是按"字符"计的。这里把每个 token 的时长按字符数均分，展平成逐字序列，
+    # 保证下标与字符一一对应（否则会出现 IndexError）。
+    asr_char_times = []   # [(char, start_sec, end_sec), ...]
+    for tok, s, e in asr_words:
+        n_chars = len(tok)
+        if n_chars == 0:
+            continue
+        per = (e - s) / n_chars
+        for k, ch in enumerate(tok):
+            asr_char_times.append((ch, s + k * per, s + (k + 1) * per))
+
+    asr_text = ''.join(c for c, _, _ in asr_char_times)
     target = ''.join(c for c in text)
 
     sm = difflib.SequenceMatcher(None, target, asr_text, autojunk=False)
@@ -228,21 +245,21 @@ def char_level_timestamps(text, wav_path, sample_rate, engine='funasr', model_id
     n = len(target)
     starts = [None] * n
     ends = [None] * n
-    asr_idx = 0
     # 通过 opcodes 对齐：只信任 equal 块；其余用插值
     matches = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == 'equal':
-            # target[i1:i2] 对应 asr[j1:j2]
+            # target[i1:i2] 对应 asr_text[j1:j2]
             for k, off in enumerate(range(j1, j2)):
-                c, s, e = asr_words[off]
+                c, s, e = asr_char_times[off]
                 matches.append((i1 + k, s, e))
     # 把所有匹配按 target 位置填入，缺失的用相邻插值
     match_map = {i: (s, e) for i, s, e in matches}
     filled = []
     last_i, last_e = -1, 0.0
     for i in range(n):
-        if i in match_map:
+        aligned = i in match_map
+        if aligned:
             s, e = match_map[i]
         else:
             # 插值：找前后最近的锚点
@@ -260,49 +277,148 @@ def char_level_timestamps(text, wav_path, sample_rate, engine='funasr', model_id
                 e = prev_e + 0.1
         starts[i] = s
         ends[i] = e
-        filled.append((target[i], s, e))
+        if return_align:
+            filled.append((target[i], s, e, aligned))
+        else:
+            filled.append((target[i], s, e))
         last_i, last_e = i, e
     return filled
 
 
-def word_level_timestamps(text, char_segs):
+def _is_pure_punct(token: str) -> bool:
+    """判断 token 是否纯标点（不含汉字/字母/数字）。"""
+    for ch in token:
+        if ch.isalnum() or '\u4e00' <= ch <= '\u9fff':
+            return False
+    return bool(token)
+
+
+def merge_punct_chars(segs):
+    """把逐字序列中的纯标点并入前一条（逐字模式用）。
+
+    标点不单独成条：时间并入前一条目；仅问号/感叹号保留文本追加到前一条目。
+
+    Args:
+        segs: [(text, start_sec, end_sec), ...]
+    Returns:
+        处理后的 [(text, start_sec, end_sec), ...]
+    """
+    out = []
+    for c, s, e in segs:
+        if _is_pure_punct(c):
+            if out:
+                pc, ps, pe = out[-1]
+                keep = c if c in _TRAILING_KEEP else ''
+                out[-1] = (pc + keep, ps, max(pe, e))
+            # 前面没有条目时直接跳过（不产生纯标点字幕）
+            continue
+        out.append((c, s, e))
+    return out
+
+
+def _clamp_unaligned_edges(segs, drop_flag=False):
+    """把首尾"未被 ASR 对齐"的字符压缩到贴近锚点的短窗口内。
+
+    首尾未对齐字符的插值时间往往跨越静音（如开头 0~0.92s 的空白），直接显示会让
+    字幕覆盖静音区；但直接丢弃又会丢失真实文本（ASR 偶尔漏字）。因此这里把它们
+    压缩成锚点旁最多 max_edge 秒的短窗口，既不覆盖长静音、也不丢文本。
+
+    Args:
+        segs: (char, start, end, aligned) 列表。
+        drop_flag: 为 True 时返回 3 元组（去掉 aligned 标记）。
+    """
+    n = len(segs)
+    if n == 0 or len(segs[0]) != 4:
+        return [(s[0], s[1], s[2]) for s in segs] if drop_flag else list(segs)
+
+    first = next((i for i in range(n) if segs[i][3]), None)
+    last = next((i for i in range(n - 1, -1, -1) if segs[i][3]), None)
+    if first is None or last is None:
+        # 没有任何对齐信息，原样返回
+        return [(s[0], s[1], s[2]) for s in segs] if drop_flag else list(segs)
+
+    MAX_EDGE, PER_CHAR = 0.6, 0.2
+    out = [[c, s, e, a] for c, s, e, a in segs]
+
+    # 头部未对齐 run [0, first)：压缩到第一个锚点前的短窗口
+    if first > 0:
+        win = min(first * PER_CHAR, MAX_EDGE)
+        run_start = max(segs[first][1] - win, 0.0)
+        per = win / first
+        for k in range(first):
+            out[k][1] = run_start + k * per
+            out[k][2] = run_start + (k + 1) * per
+
+    # 尾部未对齐 run (last, n)：压缩到最后一个锚点后的短窗口
+    tail_n = n - 1 - last
+    if tail_n > 0:
+        win = min(tail_n * PER_CHAR, MAX_EDGE)
+        run_start = segs[last][2]
+        per = win / tail_n
+        for k in range(tail_n):
+            idx = last + 1 + k
+            out[idx][1] = run_start + k * per
+            out[idx][2] = run_start + (k + 1) * per
+
+    if drop_flag:
+        return [(c, s, e) for c, s, e, _ in out]
+    return [tuple(x) for x in out]
+
+
+def word_level_timestamps(text, char_segs, clamp_unaligned_edges=True,
+                          merge_punct=True):
     """把逐字时间戳按 jieba 分词合并成词级时间戳。
 
     Args:
         text: 原文（与 char_segs 字符一一对应）。
-        char_segs: 逐字时间戳 [(char, start_sec, end_sec), ...]。
+        char_segs: 逐字时间戳，3 元组 (char, start, end) 或 4 元组
+            (char, start, end, aligned)（由 char_level_timestamps(return_align=True) 提供）。
+        clamp_unaligned_edges: 为 True 时把首尾"未被 ASR 对齐"的字符时间压缩到
+            锚点旁的短窗口（避免字幕覆盖静音，同时不丢文本）。需 4 元组输入才生效。
+        merge_punct: 为 True 时纯标点词条不单独成条：时间并入前一个词，
+            仅结尾的问号/感叹号保留文本追加到前词。
 
     Returns:
-        词级时间戳 [(word, start_sec, end_sec), ...]，每个 word 来自原文
-        （jieba 切分，含标点），start=词首字 start，end=词末字 end。
+        词级时间戳 [(word, start_sec, end_sec), ...]，每个 word 来自原文。
     """
     import jieba
-    # 用 jieba 对原文分词（保留标点）
-    tokens = [t for t in jieba.cut(text) if t.strip()]
-    if not tokens:
-        return [(c, s, e) for c, s, e in char_segs]
+    # 用 jieba 对原文分词；空白 token 会被跳过，但位置照常推进（保证下标不漂移）
+    raw_tokens = list(jieba.cut(text))
+    if not any(t.strip() for t in raw_tokens):
+        return [(s[0], s[1], s[2]) for s in char_segs]
 
-    # 建立 原文字符 -> 时间戳 的映射（跳过标点字的时间）
-    char_time = {c: (s, e) for c, s, e in char_segs}
-    # 需要按原文顺序取时间戳；char_segs 顺序即原文顺序
-    idx = 0
-    segs_by_char = {}
-    for c, s, e in char_segs:
-        segs_by_char[idx] = (s, e)
-        idx += 1
+    # 首尾未对齐字符的时间压缩（保留对齐标记，仅调整时间）
+    has_align = len(char_segs) > 0 and len(char_segs[0]) == 4
+    if has_align and clamp_unaligned_edges:
+        char_segs = _clamp_unaligned_edges(char_segs)
 
-    # 重新按原文文本映射（去掉可能被 ASR 归一化的差异）
-    # 直接按 char_segs 的顺序遍历原文字符
+    # 逐字时间戳按原文顺序建索引
+    segs_by_char = {idx: (s[1], s[2]) for idx, s in enumerate(char_segs)}
+
     pos = 0
-    words = []
-    for token in tokens:
+    words = []          # [(word, start, end), ...]
+    for token in raw_tokens:
         n = len(token)
+        if not token.strip():
+            pos += n   # 空白 token 不输出，但位置要推进
+            continue
         # 取 token 对应的字区间 [pos, pos+n)
         start = segs_by_char[pos][0] if pos in segs_by_char else 0.0
         end_pos = pos + n - 1
         end = segs_by_char[end_pos][1] if end_pos in segs_by_char else start
+
+        if merge_punct and _is_pure_punct(token):
+            # 纯标点并入前一个词：延长时间；仅保留问号/感叹号文本
+            if words:
+                pw, ps, pe = words[-1]
+                keep = ''.join(ch for ch in token if ch in _TRAILING_KEEP)
+                words[-1] = (pw + keep, ps, max(pe, end))
+            pos += n
+            continue
+
         words.append((token, start, end))
         pos += n
+
     return words
 
 
