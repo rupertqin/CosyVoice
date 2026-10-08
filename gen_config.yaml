@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════
+#  gen.py 默认配置
+# ═══════════════════════════════════════════════════════════════
+# 优先级：命令行参数 > 本文件 > 代码内置默认值
+#   - 这里没写的键 = 用代码内置默认值
+#   - 命令行显式传了某个参数 = 覆盖本文件的同名键
+#   - 空字符串 "" 表示"未设置"（该功能不启用），例如 srt: "" 表示不导出字幕
+#
+# 用 --config 指定其它配置文件；用 --no-config 完全忽略本文件。
+#
+# 本文件的取值等价于下面这条命令（因此日常只需 `python gen.py`）：
+#   python gen.py --model cosyvoice3 --voice nice_mocangli --text-file output/speech.txt \
+#     --out output/audio.m4a --srt output/audio.srt --flow-steps 5 --speed 1 --bitrate 96k
+#
+# 临时覆盖示例：
+#   python gen.py --voice man_surprise --text "换个音色试听"
+#   python gen.py --out output/audio.wav --bits 16      # 改成 16bit wav
+#   python gen.py --srt ""                              # 本次不导出字幕
+#   python gen.py --flow-steps 10                       # 本次用原版质量
+# ═══════════════════════════════════════════════════════════════
+
+# ── 模型与音色 ──
+model: cosyvoice3            # cosyvoice2 / cosyvoice3
+voice: nice_mocangli         # 见 python gen.py --help 的音色列表
+
+# ── 合成文本（二选一，text_file 优先）──
+text: ""                     # 直接写文本
+text_file: speech.txt # 从文件读文本
+
+# ── 输出 ──
+out: output/audio.m4a        # 按后缀自动选格式：wav/flac/m4a/mp3
+bits: 16                     # 仅 wav 用：16（PCM）/ 32（IEEE Float，上游行为）
+bitrate: 96k                 # 仅 m4a/mp3 用：有损码率，语音建议 96k~128k
+
+# ── 字幕 ──
+srt: output/audio.srt        # 导出的字幕路径；空字符串 = 不导出
+srt_format: srt              # srt / vtt
+srt_min_length: 12           # 单条字幕最短字数，过短相邻句会合并
+
+# ── 性能 ──
+flow_steps: 10                # Flow 扩散步数：10=原版质量，5 约快 20~35%（音质略降）
+speed: 1.0                   # 语速倍率：>1 更快更短，<1 更慢更从容
+threads: 0                   # CPU 线程数：0 = PyTorch 默认
+jobs: 1                      # 并行进程数：1 = 不并行（16GB 内存机器不建议 >1）
+seed: 0                      # 随机种子，固定可复现

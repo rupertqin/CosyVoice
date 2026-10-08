@@ -48,28 +48,43 @@ _SUBTITLE_SENT_END = re.compile(r'(?<=[。？！；.!?;:：…，,])')
 _SUBTITLE_MIN_LENGTH = 12
 # 允许保留在句尾的标点：只有问号/感叹号
 _TRAILING_KEEP = set('？！?!')
+# 句尾"包裹字符"（引号/括号的右半边）：清理句尾标点时要跨过它们看正文
+_CLOSERS = '”’」』》〉）】"\''
+# 允许从下一条字幕开头"挪回"上一条结尾的标点（开引号 “ 「 等不算）
+_MOVABLE_LEADING = set('。，、；：？！…,.!?;:）】》」』”’"\'')
+
+
+def _norm_ws(text: str) -> str:
+    """规范化空白：含中文则去掉所有空白，否则折叠为单个空格。"""
+    text = text.strip()
+    if any('\u4e00' <= ch <= '\u9fff' for ch in text):
+        return re.sub(r'\s+', '', text)
+    return re.sub(r'\s+', ' ', text)
+
+
+def _trim_body_punct(body: str) -> str:
+    """正文句尾：去掉除问号/感叹号以外的标点。"""
+    end = len(body)
+    while end > 0 and body[end - 1] in '。？！；.!?;:：…，,、':
+        end -= 1
+    if end == len(body):
+        return body
+    head = body[:end].strip()
+    keep = ''.join(ch for ch in body[end:] if ch in _TRAILING_KEEP)
+    return head + keep
 
 
 def _trim_trailing_punct(s: str) -> str:
-    """去掉句尾除问号/感叹号之外的所有标点。
+    """去掉句尾除问号/感叹号之外的所有标点（会跨过结尾的引号/括号）。
 
     例如 "今天天气真好。" -> "今天天气真好"；"你说什么？" -> "你说什么？"；
-    "太棒了！" -> "太棒了！"；"不会吧。？！" -> "不会吧？！"（保留结尾的问号感叹号）。
+    "太棒了！" -> "太棒了！"；'“很伤害脑子。”' -> '“很伤害脑子”'（引号保留）。
     """
     s = s.strip()
-    # 找到正文与句尾标点的分界：从末尾往前，连续跳过所有标点，
-    # 然后只看被跳过的部分里是否含问号/感叹号并保留它们。
-    end = len(s)
-    while end > 0 and s[end - 1] in '。？！；.!?;:：…，,、':
-        end -= 1
-    if end == len(s):
-        # 没有句尾标点，原样返回
-        return s
-    body = s[:end].strip()
-    trailing = s[end:]
-    # 只保留 trailing 中的问号/感叹号（按原顺序）
-    keep = ''.join(ch for ch in trailing if ch in _TRAILING_KEEP)
-    return body + keep
+    i = len(s)
+    while i > 0 and s[i - 1] in _CLOSERS:
+        i -= 1
+    return _trim_body_punct(s[:i]) + s[i:]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -291,6 +306,85 @@ def _is_pure_punct(token: str) -> bool:
         if ch.isalnum() or '\u4e00' <= ch <= '\u9fff':
             return False
     return bool(token)
+
+
+def _map_norm_back(raw_text, norm_sentences):
+    """把归一化后的句子映射回原始文本片段（保留原始写法，如阿拉伯数字）。
+
+    文本归一化（ttsfrd/wetext）会把"2026年10月4日"改写成中文读法，便于 TTS 朗读。
+    但字幕应显示原文。这里用 difflib 在字符级把归一化文本对齐回原文，取每句在
+    原文中的对应片段，从而既保留原写法，又保证句段数量与合成段一一对应。
+
+    Args:
+        raw_text: 未归一化的原始文本（字幕显示用）。
+        norm_sentences: text_normalize 返回的归一化句子列表。
+    Returns:
+        与 norm_sentences 等长的原文片段列表。
+    """
+    import difflib
+    norm_full = ''.join(norm_sentences)
+    if not norm_full or not raw_text:
+        return list(norm_sentences)
+
+    sm = difflib.SequenceMatcher(None, norm_full, raw_text, autojunk=False)
+    # 归一化下标 -> 原文下标的单调映射
+    idx_map = {}
+    raw_cursor = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for k in range(i2 - i1):
+                idx_map[i1 + k] = j1 + k
+        elif tag == 'replace':
+            for k in range(i1, i2):
+                idx_map[k] = j1
+        else:
+            for k in range(i1, i2):
+                idx_map[k] = raw_cursor
+        if tag != 'insert':
+            raw_cursor = j2
+
+    out = []
+    pos = 0
+    for s in norm_sentences:
+        start, end = pos, pos + len(s) - 1
+        pos += len(s)
+        r_start = idx_map.get(start)
+        r_end = idx_map.get(end)
+        if r_start is None or r_end is None or r_end < r_start:
+            out.append(s)     # 极少数无法映射的情况：保留归一化句
+            continue
+        piece = _norm_ws(raw_text[r_start:r_end + 1])
+        out.append(piece if piece else s)
+    return out
+
+
+def shift_leading_punct(segments):
+    """把每条字幕开头的"收尾标点"挪回上一条结尾。
+
+    上游句子切分可能把闭合引号等切给下一句，导致字幕里出现只含一个 "”"
+    的条目，或把引语句拆成两条。这里把它们归位；某条若因此变空，时间并入上一条。
+
+    Args:
+        segments: [{'text','start','end'}, ...]
+    Returns:
+        处理后的新列表
+    """
+    out = []
+    for seg in segments:
+        text = str(seg.get('text', ''))
+        i = 0
+        while i < len(text) and text[i] in _MOVABLE_LEADING:
+            i += 1
+        prefix, rest = text[:i], _norm_ws(text[i:])
+        if out and prefix:
+            out[-1]['text'] = out[-1]['text'].rstrip() + prefix
+        if rest:
+            out.append({'text': rest, 'start': seg['start'], 'end': seg['end']})
+        elif out:
+            # 本条只剩标点：时间并入上一条
+            out[-1]['end'] = max(out[-1]['end'], seg['end'])
+        # 若 out 为空且无正文（整条纯标点且是首条）→ 丢弃
+    return out
 
 
 def merge_punct_chars(segs):
@@ -528,6 +622,36 @@ def build_vtt(segments: List[Dict]) -> str:
     return '\n'.join(lines)
 
 
+def parse_srt(content: str) -> List[Dict]:
+    """解析 SRT 文本为 [{text, start(秒), end(秒)}, ...]。
+
+    用于并行合成后合并各分段字幕（需要整体平移时间轴）。
+    """
+    ts = re.compile(r'(\d+):(\d+):(\d+)[,.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,.](\d+)')
+    segments: List[Dict] = []
+    cur = None
+    for raw in content.splitlines():
+        line = raw.strip()
+        m = ts.search(line)
+        if m:
+            if cur is not None:
+                segments.append(cur)
+            g = [int(x) for x in m.groups()]
+            cur = {
+                'text': '',
+                'start': g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000.0,
+                'end': g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000.0,
+            }
+        elif cur is not None and line:
+            cur['text'] = (cur['text'] + '\n' + line).strip()
+        elif cur is not None:
+            segments.append(cur)
+            cur = None
+    if cur is not None:
+        segments.append(cur)
+    return segments
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Wrapper
 # ═══════════════════════════════════════════════════════════════
@@ -616,12 +740,14 @@ class CosyVoiceSRT:
         # ── Pre-split text for SRT ──
         # subtitle_text（若提供）用于字幕断句（如剥除发音注解后的干净原文），
         # 合成仍使用 tts_text（含 hotfix 拼音）。两者标点一致时句段数一一对应。
+        # 注意：text_normalize 会做文本归一化（数字→中文读法），这里把归一化后的
+        # 句子再映射回原文，使字幕保留原始写法（如"2026年10月4日"）。
         text_frontend = kwargs.pop('text_frontend', True)
         split_source = subtitle_text if subtitle_text is not None else tts_text
         if isinstance(split_source, str):
-            texts = list(self._cv.frontend.text_normalize(
+            texts = _map_norm_back(split_source, list(self._cv.frontend.text_normalize(
                 split_source, split=True, text_frontend=text_frontend
-            ))
+            )))
         else:
             # tts_text is a generator; we can't pre-split
             texts = None
@@ -683,12 +809,18 @@ class CosyVoiceSRT:
                         acc += dur
                     offset += duration
                     continue
+                if len(subs) == 1:
+                    # 单句时也要用处理后的文本（句尾只保留问号/感叹号等规则）
+                    seg_text = subs[0]
             segments.append({
                 'text': seg_text,
                 'start': offset,
                 'end': offset + duration,
             })
             offset += duration
+
+        # 上游切分可能把闭合引号等切给下一句，这里把开头的收尾标点挪回上一条
+        segments = shift_leading_punct(segments)
 
         full_audio = torch.cat(audios, dim=1) if audios else torch.empty(1, 0)
 
@@ -876,6 +1008,9 @@ class CosyVoiceSRT:
                         acc += dur
                     offset += duration
                     continue
+                if len(subs) == 1:
+                    # 单句时也应用句尾标点规则
+                    seg_text = subs[0]
             counter += 1
             entry = {
                 'index': counter,
